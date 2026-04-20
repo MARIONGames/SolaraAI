@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>404 – Page Not Found | Solara AI</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: #0a0a12;
+      color: #e2e8f0;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      text-align: center;
+      padding: 2rem;
+      overflow: hidden;
+    }
+
+    /* Subtle radial glow in the background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: radial-gradient(ellipse 80% 60% at 50% 40%, rgba(99, 102, 241, 0.15) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .container {
+      position: relative;
+      max-width: 560px;
+      width: 100%;
+    }
+
+    .code {
+      font-size: clamp(6rem, 20vw, 10rem);
+      font-weight: 800;
+      line-height: 1;
+      background: linear-gradient(135deg, #818cf8 0%, #6366f1 40%, #a78bfa 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: -4px;
+      user-select: none;
+    }
+
+    .divider {
+      width: 60px;
+      height: 3px;
+      background: linear-gradient(90deg, #6366f1, #a78bfa);
+      border-radius: 2px;
+      margin: 1.5rem auto;
+    }
+
+    .title {
+      font-size: clamp(1.4rem, 5vw, 2rem);
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 0.75rem;
+    }
+
+    .subtitle {
+      font-size: 1rem;
+      color: #94a3b8;
+      line-height: 1.6;
+      margin-bottom: 2.5rem;
+    }
+
+    .btn {
+      display: inline-block;
+      padding: 0.75rem 2rem;
+      border-radius: 9999px;
+      background: linear-gradient(135deg, #6366f1, #818cf8);
+      color: #fff;
+      font-size: 0.95rem;
+      font-weight: 600;
+      text-decoration: none;
+      transition: opacity 0.2s, transform 0.2s;
+      box-shadow: 0 4px 24px rgba(99, 102, 241, 0.35);
+    }
+
+    .btn:hover {
+      opacity: 0.9;
+      transform: translateY(-2px);
+    }
+
+    .logo {
+      position: fixed;
+      top: 1.5rem;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: #818cf8;
+      letter-spacing: 0.5px;
+      text-decoration: none;
+    }
+
+    .logo span {
+      color: #e2e8f0;
+    }
+  </style>
+</head>
+<body>
+  <a class="logo" href="/">Solara<span> AI</span></a>
+
+  <div class="container">
+    <div class="code">404</div>
+    <div class="divider"></div>
+    <h1 class="title">Page Not Found</h1>
+    <p class="subtitle">
+      The page you're looking for doesn't exist or has been moved.<br />
+      Double-check the URL, or head back home.
+    </p>
+    <a class="btn" href="/">Go Back Home</a>
+  </div>
+</body>
+</html>

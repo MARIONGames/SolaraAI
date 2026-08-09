@@ -189,6 +189,140 @@ reasoning — rather than assuming one model serves every call.
 *Consequence:* a profile/router layer sits between the agent and the backends.
 Its exact shape is open.
 
+### DECIDED — D6: Tool calls use a Solara-defined text protocol, optionally grammar-constrained
+
+Solara defines its own tool-call syntax as delimited blocks in the model's output
+stream, parsed tolerantly with repair-and-retry on malformed emissions. Where a
+backend declares grammar support (see O5), the *same* protocol is additionally
+constrained by a generated GBNF grammar so that malformed output becomes
+structurally impossible.
+
+*Rationale:* this is the only option that satisfies C2 unconditionally. The
+protocol is a property of Solara, not of the model's chat template, so swapping
+models does not change how tools are invoked. Grammar constraint is then a pure
+optimisation on backends that support it, rather than a dependency.
+
+*Rejected:* native function calling (reliability at 7B is mediocre and varies per
+model, so tool behaviour would change whenever the model changes); grammar-only
+(llama.cpp-specific, and would force remote backends onto an entirely separate
+code path, breaking D4).
+
+*Consequence:* Solara owns a tool-call parser and its repair strategy. Malformed
+tool calls are a normal, expected event to be handled, not an error state.
+
+### DECIDED — D7: One adaptive agent loop with a revisable plan and ephemeral sub-sessions
+
+A single loop owns each task. Two things make it more than a plain ReAct loop:
+
+**A revisable plan.** The task list is explicit, persistent state that the model
+rewrites as it learns. Plans authored before reading the code are usually wrong;
+the ability to revise is what makes planning worth doing at all. It also makes
+progress legible to the user and makes a task resumable.
+
+**Ephemeral sub-sessions.** The loop can delegate a sub-task to a context-isolated
+child session which runs with a fresh context, completes, returns a compact
+result, and is then evicted from the parent's context.
+
+This is the primary defence against context exhaustion, which is the binding
+constraint on small models — not intelligence. Exploration is what destroys
+context: answering "where is authentication handled?" may read thousands of tokens
+to produce one line. Done in a sub-session, only the line survives in the parent.
+
+Three rules govern sub-sessions:
+
+1. **Evicted from context, retained in the session store.** A sub-session is
+   removed from the parent's prompt but persisted — auditable, resumable, and
+   addressable by ID. Summarisation is lossy; destroying the source means work
+   must be redone when the summary proves insufficient.
+2. **Delegation is selective, never reflexive.** Each sub-session re-pays a startup
+   cost of system prompt, identity, tool schemas and briefing. On the current
+   hardware envelope, prompt processing for a 7B Q4 runs on the order of 20–40
+   tok/s, so a 4k-token briefing costs roughly 100–200 seconds before the first
+   generated token. Delegation therefore pays off only for work that **reads a lot
+   and returns a little**. Delegating a task that returns a large diff is a net
+   loss.
+3. **Invisible is not unsupervised.** Approval requests raised inside a sub-session
+   must escape to the real user (see D9). A hidden conversation must never become
+   an implicit auto-approval.
+
+*Rejected:* plain ReAct (small models drift over long horizons; no resumability, no
+progress visibility, hard to debug); plan-then-execute with a fixed plan (cannot
+recover when the plan turns out wrong, which is the common case); a standing
+multi-agent orchestrator/worker hierarchy (multiplies model calls unconditionally,
+which the hardware envelope cannot absorb — D7 gets the context-isolation benefit
+on demand instead of by structure).
+
+*Product consequence:* sub-sessions consume tokens the user never sees. Under the
+credits system (P2), invisible work is still billable work, so accounting must
+attribute sub-session cost to the parent task and surface it. Silent billing for
+hidden work is a support problem waiting to happen.
+
+### DECIDED — D8: A small core toolset, capability providers, and scoped exposure
+
+Three layers:
+
+**Core tools — always present, deliberately few.** `read_file` (line-ranged),
+`edit_file` (targeted), `write_file`, `list_directory`, `search`, `run_command`,
+and `delegate` (spawn a sub-session per D7), plus plan revision. This set is fixed
+and small because at 7B every additional tool schema is both token cost and an
+opportunity to choose wrong.
+
+**Capability providers — registered, not hardcoded.** Git, test runners, package
+managers, build systems, and later external MCP servers register their tools with
+the registry. Adding a capability never means editing the agent.
+
+**Scoped exposure — only a relevant subset reaches the prompt.** Tool schemas are
+paid for on every turn. Exposure is scoped by active providers and current task
+phase. Deliberately *not* an ML relevance model — that is over-engineering a
+problem that activation rules solve.
+
+*Rationale:* satisfies expandability without the prompt growing without bound, and
+keeps the same design working from a 7B local model up to much larger ones.
+
+*Rejected:* a flat always-exposed registry (thirty tools is thousands of tokens of
+schema every turn and measurably worse tool selection on small models);
+primitives-only, composing everything through the shell (tiny prompt and genuinely
+flexible, but it collapses security granularity — `git status` and
+`git push --force` become indistinguishable opaque strings to the policy engine,
+which is incompatible with C6 and D9).
+
+### DECIDED — D9: A single policy mediation gate in the core
+
+Every tool invocation — from any interface, at any sub-session nesting depth —
+passes through one policy engine before execution. The engine resolves each call to
+**allow**, **deny**, or **ask the user**, evaluated against:
+
+- **workspace roots** — filesystem access is jailed to declared roots; path
+  traversal and symlink escapes are resolved before the check, not after;
+- **command risk classification** — commands are classified rather than
+  pattern-matched on raw strings;
+- **the acting principal** — the local implicit owner today (D0), an authenticated
+  Rubby Account under a hosted deployment.
+
+It lives in the core, below the daemon API, so all three interfaces inherit it
+identically and no client can bypass it by constructing its own request.
+
+Two rules bind this to D7:
+
+- **Sub-sessions inherit a subset of parent permissions, never a superset.**
+  Delegation must not be a privilege-escalation ladder.
+- **Approval requests propagate to the attached human**, escaping sub-session
+  boundaries. If no interface is attached to answer, the default is deny, not
+  allow.
+
+OS-level sandboxing (containers, seccomp, bubblewrap) is designed as a **pluggable
+enforcement backend** behind this same gate rather than an alternative to it. It
+becomes necessary for hosted multi-tenant deployment (D0/P3) and remains optional
+locally.
+
+*Rationale:* one auditable choke point is the only structure that satisfies C6 as
+a property rather than a practice.
+
+*Rejected:* per-tool permission checks (inconsistent, trivially forgotten when
+adding a tool, no central audit or policy view); OS sandbox alone (strong
+isolation, but binary — it provides no basis for "ask the user first", which is the
+interaction the product actually needs, and it is awkward on Windows).
+
 ---
 
 ## Open decisions
@@ -197,12 +331,12 @@ Recorded here so the design cannot silently skip them. Roughly in dependency ord
 
 | # | Decision | Why it matters |
 |---|---|---|
-| O1 | **Tool-call protocol** — native function calling, grammar-constrained output, or a parsed text protocol. | Determines whether a 7B model can drive tools reliably, and whether the mechanism survives changing models (C2). |
-| O2 | **Agent loop shape** — single loop, plan-then-execute, adaptive loop with revisable plan, or a hierarchy. | Determines how multi-step work is structured and how many model calls a task costs. |
-| O3 | **Tool system organisation** — flat registry, capability providers, or primitives plus composed skills. Includes how tools are *exposed*: every tool schema in the prompt is a token cost and a chance to choose wrong. | Tool count is a real cost on small models with limited context. |
-| O4 | **Security enforcement point** — where policy is evaluated relative to the tool layer. | C6. Must be a single mediation point in the core so every interface inherits it and no client can bypass it. |
-| O5 | **Backend capability negotiation** — how a backend declares support for grammars, native tool calls, context length, etc. | Lets D3/D4 coexist without lowest-common-denominator behaviour. |
-| O6 | **Context assembly** — what decides which files, symbols, results and history enter the prompt. | Highest-value subsystem in a coding AI and the easiest to underbuild. |
+| ~~O1~~ | Tool-call protocol | **Closed by D6.** |
+| ~~O2~~ | Agent loop shape | **Closed by D7.** |
+| ~~O3~~ | Tool system organisation | **Closed by D8.** |
+| ~~O4~~ | Security enforcement point | **Closed by D9.** |
+| O5 | **Backend capability negotiation** — how a backend declares support for grammars, native tool calls, context length, etc. | Lets D3/D4 coexist without lowest-common-denominator behaviour. D6 depends on it directly. |
+| O6 | **Context assembly** — what decides which files, symbols, results and history enter the prompt, and what happens as the window fills. | Highest-value subsystem in a coding AI and the easiest to underbuild. Interacts directly with D7's sub-sessions. |
 | O7 | **Repository intelligence** — indexing, symbol extraction, retrieval strategy. | Required for large codebases; depends heavily on O6. |
 | O8 | **Memory** — what persists, at what scope, and how it re-enters context. | Distinct from context; must not become an unbounded prompt tax. |
 | O9 | **Event system** — whether one is warranted, and what it is genuinely for. | Named in the original vision, but must justify itself rather than be assumed. |
@@ -217,3 +351,4 @@ Recorded here so the design cannot silently skip them. Roughly in dependency ord
 | Date | Change |
 |---|---|
 | 2026-08-09 | Log created. D0–D5 recorded. Repository cleared; prior Terms of Service draft removed, with its architectural implications extracted into "Product-shape constraints" above. |
+| 2026-08-09 | D6–D9 recorded, closing O1–O4. Tool-call protocol, agent loop with ephemeral sub-sessions, tool organisation, and the policy mediation gate are settled. |

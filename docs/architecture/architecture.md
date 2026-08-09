@@ -1,9 +1,20 @@
 # Solara AI — Architecture
 
-This document is the formal architecture of Solara AI. It is derived from the
-decisions in [`decisions.md`](./decisions.md), which records *why* each choice was
-made and what was rejected. Where the two disagree, the decision log wins and this
-document is out of date.
+The formal architecture of Solara AI, derived from the decisions in
+[`decisions.md`](./decisions.md), which records *why* each choice was made and what
+was rejected. Where the two disagree, the decision log wins and this document is out
+of date.
+
+**Deep dives.** This document is the map. The detail lives in:
+
+| Document | Covers |
+|---|---|
+| [`execution-graph.md`](./execution-graph.md) | Work units, scheduler, concurrency, resource model, checkpoints |
+| [`model-orchestration.md`](./model-orchestration.md) | Speculative decoding, cascade, critic, self-consistency, routing, profiles |
+| [`code-intelligence.md`](./code-intelligence.md) | Symbol, dependency and call graphs; change-impact analysis; architecture maps |
+| [`resilience.md`](./resilience.md) | Stuck detection, recovery, shadow snapshots, budgets |
+| [`learning.md`](./learning.md) | Trajectories, implicit labels, eval ratchet, distillation |
+| [`distribution.md`](./distribution.md) | Worker pools, placement, why inference distributes and execution does not |
 
 ---
 
@@ -13,18 +24,25 @@ Solara AI is a **coding AI first**. Software development is its purpose, not one
 capability among many.
 
 Solara is a **platform, not a chat wrapper**. The model is a replaceable component
-inside it. Identity, coding behaviour, tools, context, memory, and security belong
-to Solara and survive swapping the model underneath.
+inside it. Identity, coding behaviour, tools, context, memory, and security belong to
+Solara and survive swapping the model underneath.
 
-Three properties define the shape of everything below:
+Four properties define the shape of everything below:
 
-1. **One brain, many interfaces.** VS Code, desktop, and web are thin clients over
-   a single core. No interface contains agent logic.
+1. **One brain, many interfaces.** VS Code, desktop, and web are thin clients over a
+   single core. No interface contains agent logic.
 2. **Everything at the edges is replaceable.** Models, inference engines, tools,
-   retrieval strategies, and interfaces are all implementations behind interfaces.
-3. **Small models are a first-class target.** The architecture assumes constrained
-   hardware and treats context and output tokens as scarce resources. Designs that
-   only work with a large model are rejected.
+   retrieval strategies, workers, and interfaces are implementations behind
+   interfaces.
+3. **Small models are a first-class target.** Context and output tokens are treated
+   as scarce. Designs that only work with a large model are rejected.
+4. **Capability in the architecture, modest defaults in configuration.** Hardware
+   determines settings, never structure. Every mechanism degrades cleanly when its
+   budget is set to one.
+
+The fourth property is a correction. The first version of this architecture let the
+current laptop constrain the design itself, which contradicted the requirement that
+Solara not be tied to one machine. Decisions D21–D26 fixed that.
 
 ---
 
@@ -32,12 +50,14 @@ Three properties define the shape of everything below:
 
 | Principle | Consequence |
 |---|---|
-| **The model is a component.** | Nothing model-specific leaks above the model layer. Tool calling, identity, and formatting are Solara's, not the model's. |
-| **Context is the scarce resource.** | Every subsystem is judged partly by what it costs in tokens. Deduplication and eviction are designed, not emergent. |
-| **Security is a choke point, not a practice.** | One gate every action passes through, below the API, so no interface and no nesting depth can bypass it. |
-| **Structure before semantics.** | Exact, cheap, debuggable mechanisms (parsers, search, files) before probabilistic ones (embeddings, learned relevance). |
-| **Visible over clever.** | Memory, plans, and permissions are inspectable and correctable by the user. Silent state that shapes behaviour is a defect. |
-| **Seams before features.** | Boundaries for things not yet built (hosted accounts, credits, sandboxing, fine-tuned models) are defined now and stubbed. |
+| **The model is a component.** | Nothing model-specific leaks above the model layer. Tool calling, identity and formatting are Solara's. |
+| **Context is the scarce resource.** | Every subsystem is judged partly in tokens. Deduplication and eviction are designed, not emergent. |
+| **Security is a choke point, not a practice.** | One gate every action passes through, below the API, above every worker. |
+| **Structure before semantics.** | Parsers, graphs and search before embeddings and learned relevance. |
+| **Honest uncertainty.** | Where analysis is approximate — heuristic call edges, stale index regions — the agent is told, not misled. |
+| **Visible over clever.** | Memory, plans, routing decisions and permissions are inspectable and correctable. |
+| **Degrade, don't fail.** | Budget pressure lowers tiers; worker loss falls back to local; recovery precedes failure. |
+| **Seams before features.** | Boundaries for unbuilt things are defined now and stubbed. |
 
 ---
 
@@ -45,150 +65,148 @@ Three properties define the shape of everything below:
 
 ```mermaid
 flowchart TB
-    subgraph I["Interface layer — thin clients"]
-        VS["VS Code extension"]
-        DT["Desktop app"]
-        WB["Web app"]
-        CLI["Terminal client"]
+    subgraph I["Interfaces — thin clients"]
+        VS["VS Code"]
+        DT["Desktop"]
+        WB["Web"]
+        CLI["Terminal"]
     end
 
-    subgraph D["Daemon — HTTP + WebSocket, loopback, token-authenticated"]
-        API["API surface"]
+    subgraph D["Daemon — loopback, token-authenticated"]
+        API["Versioned API"]
         EV["Event stream"]
     end
 
     subgraph O["Orchestration"]
-        LOOP["Agent loop"]
-        PLAN["Plan state"]
-        SUB["Sub-sessions"]
+        GRAPH["Execution graph"]
+        SCHED["Scheduler"]
+        REC["Recovery"]
     end
 
     subgraph N["Intelligence"]
         CTX["Context assembler"]
-        WS["Working set"]
-        IDX["Workspace index"]
+        WSET["Working set"]
+        CI["Code intelligence"]
         MEM["Memory"]
         ID["Identity"]
     end
 
     subgraph C["Capability"]
         REG["Tool registry"]
-        CORE["Core tools"]
-        PROV["Capability providers"]
+        PROV["Providers"]
         POL["Policy gate"]
     end
 
-    subgraph M["Model"]
-        ROUTE["Profile router"]
-        PROTO["Tool-call protocol"]
-        BE["Model backends"]
+    subgraph M["Model orchestration"]
+        ROUTE["Router"]
+        CASC["Cascade / critic"]
+        PROTO["Tool protocol"]
+    end
+
+    subgraph W["Workers"]
+        INF["Inference workers"]
+        EXEC["Execution worker (local)"]
     end
 
     subgraph P["Persistence"]
-        STORE["Session store · index · memory files"]
+        STORE["Sessions · index · memory · snapshots · trajectories"]
     end
 
     I --> API
     EV --> I
-    API --> LOOP
-    LOOP --> PLAN
-    LOOP --> SUB
-    LOOP --> CTX
-    CTX --> WS
-    CTX --> IDX
+    API --> GRAPH
+    GRAPH --> SCHED
+    SCHED --> REC
+    SCHED --> CTX
+    CTX --> WSET
+    CTX --> CI
     CTX --> MEM
     CTX --> ID
-    LOOP --> REG
-    REG --> CORE
+    SCHED --> REG
     REG --> PROV
     REG --> POL
-    POL -.approval request.-> EV
-    LOOP --> PROTO
+    POL -.approval.-> EV
+    POL --> EXEC
+    SCHED --> PROTO
     PROTO --> ROUTE
-    ROUTE --> BE
+    ROUTE --> CASC
+    CASC --> INF
     O --> STORE
     N --> STORE
 ```
 
 Dependencies point downward. The model layer knows nothing about sessions; the
 capability layer knows nothing about models; interfaces know nothing about either.
+The policy gate sits above execution and **never moves to a worker**.
 
 ---
 
 ## 4. The layers
 
-### 4.1 Interface layer
+### 4.1 Interfaces
 
-VS Code extension, desktop app, web app, and a terminal client — all TypeScript
-except the terminal client, all **thin**. They render state and collect input.
-They contain no agent logic, no prompt construction, and no tool execution.
-
-They connect to the daemon over its versioned API and render the activity stream.
-Because the stream is the only source of truth about what Solara is doing, a new
+VS Code extension, desktop app, web app, terminal client. All **thin**: they render
+state and collect input, and contain no agent logic, prompt construction, or tool
+execution. They speak the versioned API and render the activity stream, so a new
 interface is a rendering problem rather than a reimplementation.
 
-*Local vs. hosted:* a browser cannot reach a local daemon over the internet. The
-web app is therefore served **by the daemon itself** for local use. The hosted
-deployment at `solara.rubby-studios.com` runs the same core server-side per
-principal — the seam that D0 keeps open and does not yet implement.
+A browser cannot reach a local daemon over the internet, so the local web app is
+served **by the daemon itself**. The hosted deployment runs the same core
+server-side per principal — the D0 seam, defined and unimplemented.
 
 ### 4.2 Daemon
 
-A long-running process that owns the core and the loaded model. Keeping the model
-resident across requests is a primary reason this layer exists: reload costs are
-punitive on the target hardware.
+A long-running process owning the core and the loaded models. Model residency across
+requests is a primary reason it exists: reload costs are punitive on the target
+hardware.
 
-- **HTTP** for operations: session lifecycle, sending a request, interruption,
-  approval responses, workspace and profile management.
-- **WebSocket** for the activity stream.
-- **Loopback binding and a per-session bearer token are mandatory.** The daemon
-  loads a model and executes shell commands; without both, any local process or
-  visited web page obtains arbitrary code execution. This is a property of the
-  transport, not a hardening task for later.
-- **Versioned from the first commit**, because three interfaces depend on it and
-  will not upgrade together.
-- **Interruption cancels mid-generation** and leaves the session resumable. At
-  3–6 tok/s users stop tasks constantly; interruption that only lands between model
-  calls is not usable.
+HTTP for operations, WebSocket for the activity stream. **Loopback binding and a
+per-session bearer token are mandatory** — the daemon loads models and executes shell
+commands, so without both, any local process or visited web page obtains arbitrary
+code execution. Versioned from the first commit. Interruption cancels
+mid-generation and leaves the session resumable, because at 3–6 tok/s users stop
+tasks constantly.
 
 ### 4.3 Orchestration
 
-**The agent loop** owns a task from request to completion. One loop, not a standing
-hierarchy of agents.
+**A task is a graph, not a loop.** Work units declare kind, dependencies, context
+policy, resource class, permissions, and an explicit result contract. A scheduler
+runs whatever is runnable within budget. **A loop is a graph of width one**, so
+concurrency 1 reproduces sequential behaviour exactly.
 
-**Plan state** is explicit, persistent, and revisable. The model rewrites it as it
-learns, because a plan written before reading the code is usually wrong. It also
-makes progress legible and tasks resumable.
+**The plan is the graph.** Revising the plan means mutating the graph — adding,
+superseding, cancelling, re-opening units. There is no separate plan artifact that
+can drift from what is executing.
 
-**Phases** — explore, plan, edit, verify — guide behaviour and scope tool exposure.
-They are soft: the loop moves between them as the work demands.
+**Concurrency is derived from hardware, not fixed.** Under llama.cpp, concurrent
+requests share model weights through continuous batching, so a slot costs KV cache
+rather than a second model — roughly 56 KB/token for Qwen2.5-Coder-7B, about 450 MB
+at 8k context. On GPU that makes concurrency cheap. **On CPU it does not**: parallel
+slots contend for the same cores, so throughput stays flat while latency doubles.
+The scheduler models this and defaults to concurrency 1 on CPU hosts.
 
-**Sub-sessions** are the primary defence against context exhaustion. The loop may
-delegate a sub-task to a context-isolated child that runs fresh, returns a compact
-result, and is evicted from the parent's context.
+**Isolated units are the context defence.** A unit may run with a fresh context,
+return a compact result under its declared contract, and be evicted from the parent's
+context while persisting in the store. It pays off only for work that **reads a lot
+and returns a little** — exploration and failure triage — because each isolated unit
+re-pays identity, tool schemas and briefing, which at ~20–40 tok/s prompt processing
+is 100–200 seconds for a 4k briefing.
 
-Three rules govern them:
+**Writes serialise.** Reads parallelise freely; two units editing one file is a
+correctness hazard, so write sets are declared and locked.
 
-- **Evicted from context, retained in the store.** Summaries are lossy; destroying
-  the source means redoing the work when the summary proves insufficient.
-- **Selective, never reflexive.** A sub-session re-pays identity, tool schemas, and
-  briefing. At roughly 20–40 tok/s prompt processing on the current machine, a 4k
-  briefing costs 100–200 seconds before its first output token. Delegation pays off
-  only for work that **reads a lot and returns a little** — exploration and failure
-  triage are the archetypes; producing a large diff is not.
-- **Invisible is not unsupervised.** Approvals raised inside a sub-session escape to
-  the real user, and permissions are inherited as a subset, never a superset.
+→ [`execution-graph.md`](./execution-graph.md)
 
 ### 4.4 Intelligence
 
-**The context assembler** builds the prompt every turn from prioritised segments
-under a token budget derived from the backend's declared context length:
+**The context assembler** builds each unit's prompt from prioritised segments under a
+budget derived from the backend's declared context length:
 
 | Priority | Segment |
 |---|---|
 | 1 | Identity |
 | 2 | Tool schemas (scoped) |
-| 3 | Plan state |
+| 3 | Graph state relevant to this unit |
 | 4 | Workspace memory (bounded excerpt) |
 | 5 | Working set |
 | 6 | Conversation history |
@@ -197,161 +215,265 @@ under a token budget derived from the backend's declared context length:
 Eviction is **by priority, then recency** — never recency alone, or important early
 facts are lost merely for being early.
 
-**The working set** is where file content lives, and the only place it lives.
-Conversation history references it rather than repeating it, so a file read three
-times occupies context once. It makes "what can the model currently see" an
-explicit, inspectable property rather than an accident of message ordering.
+**The working set** is where file content lives, and the only place it lives. History
+references it rather than repeating it, so a file read three times occupies context
+once. It makes "what can the model currently see" explicit and inspectable.
 
-**The workspace index** is structural: tree-sitter parsing into symbols,
-definitions, references and imports, plus fast literal and regex search. It is
-tiered — no index for single files, in-memory for small projects, persistent and
-incremental for large ones. Semantic embeddings sit behind a `Retriever` seam,
-deliberately unbuilt: code lookup is overwhelmingly exact, and a second resident
-model is expensive on a 16 GB machine.
+**Code intelligence** is layered and structural:
 
-**Memory** is three bounded, human-readable stores: a per-workspace memory file, a
-user-global preferences file, and the durable session store. Solara writes memory
-through the ordinary edit path, so a wrong fact is visible and correctable rather
-than silently poisoning every future session.
+```
+5  Architecture map        modules, layers, entry points, hot spots
+4  Change-impact analysis  what breaks if this changes
+3  Call graph              who calls whom, with confidence labels
+2  Dependency graph        what imports what
+1  Symbol index            definitions, references, exports
+0  Files and text          content-addressed, searchable
+```
 
-**Identity** is a structured artifact — core identity, coding philosophy, hard
-rules, output conventions, tool-use discipline — not a prompt string. See §6.
+Change-impact analysis is the payoff: it makes verification's targeted-test tier
+genuinely targeted, drives critic-pass policy, and is the real content of
+"understanding a large codebase." Call-graph edges are labelled `certain`,
+`probable`, `heuristic` or `unresolved`, because precise call graphs are undecidable
+for dynamic languages and hiding that produces confident wrong answers. History
+intelligence — churn, co-change coupling — activates only when version control
+exists.
+
+**Memory** is three bounded, human-readable stores: a per-workspace memory file, user
+preferences, and the session store. Written through the ordinary edit path, so a
+wrong fact is visible and correctable rather than silently poisoning future sessions.
+
+**Identity** is a structured artifact, not a prompt string. See §6.
+
+→ [`code-intelligence.md`](./code-intelligence.md)
 
 ### 4.5 Capability
 
 **Core tools**, always present and deliberately few: `read_file` (line-ranged),
-`edit_file`, `write_file`, `list_directory`, `search`, `run_command`, `delegate`,
-and plan revision. Small because every tool schema is both token cost and an
-opportunity for a small model to choose wrong.
+`edit_file`, `write_file`, `list_directory`, `search`, `run_command`, `delegate`, and
+graph mutation. Small because every schema is both token cost and an opportunity for
+a small model to choose wrong.
 
 **Capability providers** register everything else — version control, test runners,
-package managers, build systems, and later external MCP servers. Adding a
-capability never means editing the agent. Providers **activate on detection**: a
-workspace with no version control and no test runner is an ordinary case, not an
-error.
+package managers, build systems, later MCP servers. They **activate on detection**: a
+workspace with no version control and no test runner is an ordinary case.
 
-**The policy gate** is the single point every tool invocation passes through, from
-any interface at any nesting depth, resolving each call to **allow**, **deny**, or
-**ask**. It evaluates workspace roots (with traversal and symlink escapes resolved
-*before* the check), command risk classification, and the acting principal. No
-attached interface, or an expired request, resolves to **deny**.
+**The policy gate** is the single point every tool invocation passes through, from any
+interface at any graph depth, resolving **allow / deny / ask**. It evaluates workspace
+roots (traversal and symlink escapes resolved *before* the check), command risk
+classification, and the acting principal. No attached interface, or an expired
+request, resolves to **deny**. Units inherit a subset of parent permissions, never a
+superset.
 
-OS-level sandboxing plugs in behind this same gate as an additional enforcement
-backend — required for hosted multi-tenancy, optional locally.
+OS-level sandboxing plugs in behind the same gate as an additional enforcement
+backend.
 
-### 4.6 Model
+### 4.6 Model orchestration
 
-**Model profiles** bundle weights, prompt template, sampling parameters, identity
-rendering, and tool policy. A profile — not a prompt variant — is what a behaviour
-mode selects. This is also how task-appropriate routing works: a small fast model
-for classification, summarisation and mechanical edits; a larger one for planning
-and reasoning.
+**Profiles** bundle weights, template, sampling, identity rendering, tool policy,
+content rules and tier. A behaviour mode selects a profile, not a prompt variant.
 
-**The tool-call protocol** is Solara's own, not the model's. Delimited blocks in the
-output stream, parsed tolerantly with repair-and-retry, and additionally
-grammar-constrained where the backend supports it. Malformed tool calls are an
-expected event with a defined recovery path, not an error state.
+**Four orchestration mechanisms**, distinct and composable:
 
-**Model backends** implement one interface. The first manages a `llama-server`
-child process and uses **both** its OpenAI-compatible and **raw completion**
-endpoints. Retaining raw access is what preserves prompt-template control, GBNF
-grammar constraints, and explicit sampling and cache control. Remote backends
-implement the same interface; local is the default, remote is not a special case.
+| Mechanism | Buys | Costs |
+|---|---|---|
+| **Speculative decoding** | ~2–3× throughput on GPU, less on CPU | A draft model resident (~350–400 MB at 0.5B Q4) |
+| **Cascade** | Fewer expensive calls | A verification step; latency on escalation |
+| **Critic pass** | Fewer bad edits reaching disk | Roughly doubles the edit path |
+| **Self-consistency** | Better answers from cheap models | N× tokens; needs parallelism |
 
-**Capabilities are declared, not assumed.** Each backend exposes context length,
-maximum output, grammar support, native tool-calling, streaming, cache reuse, and
-token counting. Solara selects strategies from that descriptor, and every capability
-has a working fallback.
+Cascade pays when the cheap tier's success rate exceeds roughly
+`(c_cheap + c_verify) / c_expensive` — so it applies to mechanical edits,
+classification and triage, and not to novel design where verification is as hard as
+the task.
 
-### 4.7 Persistence
+**The router** maps *(unit kind, complexity, remaining budget, hardware, mode,
+escalation history)* to a profile. Every decision is emitted with its reason; users
+can pin a profile; mode selection is absolute and the router only chooses tiers
+within it; budget pressure lowers tiers **before** truncating context, because
+degrading the model is more recoverable than degrading its information.
 
-Sessions and sub-sessions, the structural index, and memory files. Workspace memory
-lives inside the workspace when writable, so it is diffable and — where version
-control exists — committable at the user's discretion. Nothing in persistence
+**The tool-call protocol** is Solara's own — delimited blocks parsed tolerantly with
+repair-and-retry, additionally grammar-constrained where the backend declares
+support. Malformed calls are an expected event with a defined recovery path.
+
+→ [`model-orchestration.md`](./model-orchestration.md)
+
+### 4.7 Workers
+
+Compute is a pool of typed workers, and the asymmetry between them is the whole
+design:
+
+- **Inference workers distribute freely** — local child process, remote LAN machine,
+  bare inference server, or cloud endpoint. They exchange tokens, not state.
+- **Execution workers do not.** `pytest` runs against files; a tool call is
+  meaningless without its workspace. Remote execution requires a synchronised
+  workspace, which is the hosted-deployment problem and is not solved here.
+
+Locality is a hard scheduling constraint, never a preference. Short units prefer
+local workers because a network round-trip can exceed a tier-1 call. **The system
+remains fully functional with zero remote workers** — distribution is an accelerator,
+never a dependency. **The policy gate never moves to a worker**: a misbehaving
+inference worker can produce bad output, but it cannot authorise a command.
+
+The near-term payoff is concrete: the laptop holds the workspace, runs all tools and
+enforces policy; a desktop GPU machine serves inference.
+
+→ [`distribution.md`](./distribution.md)
+
+### 4.8 Resilience
+
+Recovery is a subsystem, not scattered error handling, because burning an entire
+budget repeating one mistake is the *characteristic* failure of small models on long
+tasks.
+
+**Stuck signals**: repeated near-identical tool calls, no file-state change across
+units, identical verification failures, repeated edit-match failures, oscillating
+content hashes, budget consumed without graph progress, plan thrash.
+
+**Escalating responses**: **reflect** (a cheap tool-less unit that states what was
+tried and why it failed — often sufficient, since stuckness is usually an attention
+problem), **backtrack** to a checkpoint, **switch strategy**, **escalate to the user**
+with a real account, **abort to a clean workspace**.
+
+**Shadow snapshots** make backtracking possible without version control: copy-on-write
+copies of files Solara modified, keyed by checkpoint, stored outside the workspace.
+Where a VCS exists it is a safety net, never the mechanism — Solara does not create
+commits, stashes or branches unasked.
+
+**Budgets degrade before they fail.** At 70% the router lowers tiers; at 90%
+speculative work stops; at 100% the task escalates with state intact — never silently
+killed, never silently continued.
+
+→ [`resilience.md`](./resilience.md)
+
+### 4.9 Learning
+
+Sessions produce **trajectories**: assembled context (recorded, not reconstructed),
+raw model output (kept alongside the parse), tool calls, edits, verification
+outcomes, interventions, cost and environment.
+
+Outcomes are labelled from **implicit signals**, since nobody labels manually. The
+strong ones — verification passed, edit survived, user reverted immediately, user
+rephrased the same request — produce training data. Weaker ones inform routing.
+Unknown outcomes are discarded rather than guessed.
+
+**The eval suite is a ratchet**: frozen, checkable cases covering protocol
+conformance, edit application, task completion, context discipline, identity, safety,
+efficiency and resilience. Every real failure becomes a case. Cases are never edited
+to make them pass.
+
+**Distillation** is the realistic path to Solara-specific models: a strong remote
+backend executes real tasks through the full stack, verification filters the results,
+and survivors become supervised examples whose *input is Solara's assembled context*
+and whose *output is Solara's tool protocol*. That is what makes the result
+Solara-specific rather than generically good at code — and a LoRA on modest hardware
+can do it.
+
+Trajectories contain the user's source. **Local by default, opt-in to collect,
+redacted on export, individually deletable.**
+
+→ [`learning.md`](./learning.md)
+
+### 4.10 Persistence
+
+Sessions and graphs, the layered index, memory files, shadow snapshots, and
+trajectories. SQLite for indexes and structured state; plain files for memory, so it
+stays diffable. Workspace memory lives inside the workspace when writable. Nothing
 assumes version control.
 
 ---
 
 ## 5. Key flows
 
-### 5.1 A request, end to end
+### 5.1 A task, end to end
 
 ```mermaid
 sequenceDiagram
     participant U as Interface
     participant D as Daemon
-    participant L as Agent loop
+    participant S as Scheduler
     participant X as Context assembler
-    participant M as Model backend
+    participant R as Router
+    participant W as Inference worker
     participant G as Policy gate
     participant T as Tool
 
-    U->>D: send request (session id)
-    D->>L: dispatch
-    loop until task complete
-        L->>X: assemble prompt
-        X-->>L: prompt within budget
-        L->>M: generate
-        M-->>L: stream tokens
-        L-->>U: token deltas (event stream)
-        alt output contains a tool call
-            L->>G: request invocation
+    U->>D: request (session id)
+    D->>S: seed graph with a root unit
+    loop until graph complete or escalated
+        S->>S: compute ready set, admit within budget
+        S->>X: assemble context for unit
+        X-->>S: prompt within budget
+        S->>R: route unit
+        R-->>S: profile (tier, worker)
+        S->>W: generate
+        W-->>S: stream tokens
+        S-->>U: token deltas + unit lifecycle events
+        alt tool call emitted
+            S->>G: request invocation
             alt policy = ask
-                G-->>U: approval request (event stream)
+                G-->>U: approval request
                 U-->>G: decision
             end
             G->>T: invoke (if allowed)
-            T-->>L: result
-            L->>X: update working set
-        else output is a reply
-            L-->>U: final response
+            T-->>S: result
+            S->>X: update working set
+        else graph mutation emitted
+            S->>S: add / supersede / cancel units
+            S-->>U: plan updated
+        else unit complete
+            S->>S: checkpoint, unblock dependents
         end
     end
+    S-->>U: final response
 ```
 
-### 5.2 Delegation to a sub-session
+### 5.2 Delegation
 
-The loop decides a sub-task reads a lot and returns a little. It writes a briefing,
-opens a sub-session with a subset of its permissions, and waits. The child runs its
-own loop with a fresh context, using the same tools through the same gate. It
-returns a compact result, which enters the parent's working set. Everything it read
-does not. The transcript is persisted and addressable; it is gone from the prompt,
-not from the system.
+The scheduler judges a sub-task read-heavy and return-light. It writes a briefing,
+creates an isolated unit with a subset of the parent's permissions and a declared
+result contract, and schedules it. The child runs with a fresh context, using the
+same tools through the same gate. Its compact result enters the parent's working set;
+everything it read does not. Its transcript persists and stays addressable.
 
 ### 5.3 An edit
 
-The model emits an exact search/replace block. Solara applies it only on exact
-match, then parse-checks the result with the tree-sitter grammar already loaded for
-indexing; an edit that breaks syntax is rejected and reported rather than written.
-A failed match re-reads the region and retries once against fresh content; repeated
-failure escalates to rewriting the enclosing function or block — never the whole
+The model emits an exact search/replace block. Solara applies it only on exact match,
+then parse-checks the result with the tree-sitter grammar already loaded for
+indexing; a syntax-breaking edit is rejected, not written. Change-impact analysis
+scores the blast radius, which decides whether a critic pass runs and which tests
+verification should target. A failed match re-reads the region and retries once;
+repeated failure escalates to rewriting the enclosing function — never the whole
 file, because full-file output at 3–6 tok/s costs tens of minutes.
+
+### 5.4 Getting stuck
+
+Signals accumulate. Recovery runs a tool-less reflect unit; if that yields no new
+approach, it restores graph and file state to the last checkpoint *before the
+deciding branch*, marks the failed subtree superseded, and switches strategy —
+usually a tier escalation or a fresh diagnosis. Bounded attempts, then escalation to
+the user with a real account of what was tried.
 
 ---
 
-## 6. How identity is actually enforced
+## 6. How identity is enforced
 
-Identity is enforced at three levels, which is what makes it structural rather than
-aspirational:
+Three levels, which is what makes it structural rather than aspirational:
 
-1. **Composition** — the identity artifact is rendered into the prompt per model
-   profile. Profiles may adapt the rendering to a model's template; the source of
-   truth remains one artifact.
+1. **Composition** — the identity artifact renders into the prompt per profile.
+   Profiles adapt the rendering; the source of truth is one artifact.
 2. **Runtime** — the tool protocol and policy gate constrain what Solara can *do*,
-   independent of what any model says. Behaviour that matters is enforced by the
-   system, not requested of the model.
-3. **Evaluation** — an eval suite asserts Solara behaves as Solara on any backend,
-   so changing models is a measurable event rather than a silent drift.
+   independent of what any model says.
+3. **Evaluation** — the eval suite asserts Solara behaves as Solara on any backend, so
+   changing models is measurable rather than silent.
 
-**Behaviour modes are model profiles, not exemptions.** A more permissive mode
-selects different weights and a relaxed content rule set. It does not relax the
-policy gate, the workspace jail, or approval requirements — those are properties of
-Solara, and no profile can switch them off.
+**Behaviour modes are profiles, not exemptions.** A permissive mode selects different
+weights and content rules. It does not relax the policy gate, the workspace jail, or
+approval requirements — those are properties of Solara, and no profile can switch them
+off.
 
-Longer term, fine-tuned Solara-specific models are where identity ultimately
-belongs. The eval suite is already the validation harness for that work, and real
-sessions accumulate the data. That path is a continuation of this architecture, not
-a replacement for it.
+Fine-tuned Solara-specific models are where identity ultimately belongs; §4.9 is the
+path there, and the eval suite is already its validation harness.
 
 ---
 
@@ -361,21 +483,27 @@ a replacement for it.
 solara/
   core/            shared types, configuration, errors
   identity/        identity artifact and composition
-  model/           ModelBackend interface, profiles, router
+  model/           ModelBackend interface, profiles
     backends/      llama.cpp (managed process), OpenAI-compatible
+    orchestration/ router, cascade, critic, self-consistency
   protocol/        tool-call syntax, tolerant parser, grammar generation
-  agent/           loop, phases, plan state, sub-sessions
+  graph/           work units, mutation, checkpoints
+  scheduler/       admission, ranking, placement, write locks
+  recovery/        stuck signals, strategies, shadow snapshots, budgets
   context/         assembler, working set, token budgeting
-  workspace/       roots, identity, tree-sitter index, search
+  workspace/       roots, identity, tiering
+    index/         symbols, dependency graph, call graph, impact, arch map
   memory/          workspace memory, user memory
   tools/           registry, core tools, scoped exposure
     providers/     version control, tests, packages, build, MCP (later)
   policy/          policy gate, risk classification, approvals
-  session/         session and sub-session store
+  session/         session and unit store
+  workers/         registry, health, transport
   events/          typed event definitions and emission
   daemon/          HTTP and WebSocket API, authentication
   accounting/      usage metering — local no-op, hosted seam
-  eval/            identity and capability evaluation harness
+  learning/        trajectories, labelling, export, distillation pipeline
+  eval/            frozen cases, runners, reporting
 
 clients/
   terminal/        first client, proves the API
@@ -388,66 +516,83 @@ clients/
 
 ## 8. Extension points
 
-The modularity contract. Each is an interface with at least one implementation and
-a defined path to more.
+The modularity contract. Each is an interface with at least one implementation and a
+defined path to more.
 
 | Extension point | Add by |
 |---|---|
-| **Inference engine** | Implementing `ModelBackend` and declaring capabilities. |
-| **Model** | Adding a model profile. No code change. |
-| **Behaviour mode** | Adding a model profile with its own rule set. |
-| **Tool** | Registering with the tool registry; the policy gate applies automatically. |
-| **Capability provider** | Implementing detection plus tool registration. |
-| **Retrieval strategy** | Implementing `Retriever` — where embeddings would land. |
-| **Interface** | Speaking the versioned API and rendering the event stream. |
-| **Security enforcement** | Adding an enforcement backend behind the policy gate. |
-| **Observability / accounting** | Subscribing to the typed event stream. |
+| **Inference engine** | Implementing `ModelBackend` and declaring capabilities |
+| **Model** | Adding a profile. No code change |
+| **Behaviour mode** | Adding a profile with its own content rules |
+| **Draft model** | Declaring it on a profile; the backend handles the rest |
+| **Tool** | Registering with the registry; the policy gate applies automatically |
+| **Capability provider** | Implementing detection plus tool registration |
+| **Language support** | Adding a tree-sitter grammar plus an import resolver |
+| **Retrieval strategy** | Implementing `Retriever` — where embeddings would land |
+| **Work unit kind** | Registering a kind with its context policy and routing hint |
+| **Recovery strategy** | Registering a signal plus a response |
+| **Worker** | Registering an endpoint with declared capabilities and locality |
+| **Interface** | Speaking the versioned API and rendering the event stream |
+| **Security enforcement** | Adding an enforcement backend behind the policy gate |
+| **Observability / accounting** | Subscribing to the typed event stream |
 
 ---
 
 ## 9. Deliberately not built yet
 
-Named so they are recognised as deferred decisions rather than oversights. Each has
-a defined seam.
+Named so they are recognised as deferred decisions rather than oversights. Each has a
+seam.
 
-| Deferred | Seam that keeps it reachable |
+| Deferred | Seam |
 |---|---|
-| Accounts and multi-tenancy | The principal on every session; the identity boundary. |
-| Credits and metering | The accounting module, subscribed to the event stream. |
-| OS-level sandboxing | An enforcement backend behind the policy gate. |
-| Semantic embeddings | The `Retriever` interface. |
-| Fine-tuned Solara models | Model profiles plus the eval harness. |
-| MCP integration | The capability provider interface. |
-| Internal message bus | The typed event stream it would grow from. |
-| Inline completion | A distinct low-latency path; deliberately not the agent loop. |
+| Accounts and multi-tenancy | The principal on every session |
+| Credits and metering | The accounting module, on the event stream |
+| OS-level sandboxing | An enforcement backend behind the policy gate |
+| Workspace synchronisation | Required before remote execution workers are meaningful |
+| Semantic embeddings | The `Retriever` interface |
+| Fine-tuned Solara models | Profiles plus the eval harness plus the distillation pipeline |
+| MCP integration | The capability provider interface |
+| Internal message bus | The typed event stream it would grow from |
+| Inline completion | A distinct low-latency path, deliberately not the agent graph |
 
 ---
 
 ## 10. Build order
 
 The first milestone is a **vertical slice**, not a layer-by-layer build: terminal
-client → daemon → session → agent loop → tool protocol → policy gate → core tools →
-llama.cpp backend, running a real task against a real workspace on the current
+client → daemon → session → graph at width 1 → tool protocol → policy gate → core
+tools → llama.cpp backend, running a real task against a real workspace on current
 hardware. Concretely: read a file, make one search/replace edit, verify it parses,
 report back — starting with a 1.5B or 3B model, because iteration speed matters more
 than capability while the plumbing is being proven.
 
-Every risky assumption in this architecture lives at a seam: whether a small model
-can drive the tool protocol, whether edits apply cleanly, whether context assembly
-stays inside budget, whether the loop is bearable at local speeds. A vertical slice
-tests all of them in days. A horizontal build tests none of them for months.
+Every risky assumption lives at a seam: whether a small model can drive the protocol,
+whether edits apply cleanly, whether context assembly stays in budget, whether the
+loop is bearable at local speeds. A vertical slice tests all of them in days; a
+horizontal build tests none for months.
 
-| Stage | Adds |
-|---|---|
-| 1 | The vertical slice above. |
-| 2 | The full core toolset, plan state, phases, verification tiers 1–2. |
-| 3 | Workspace index, scoped tool exposure, capability providers. |
-| 4 | Sub-sessions and delegation. |
-| 5 | Memory, identity eval harness. |
-| 6 | VS Code extension; desktop and web clients. |
-| 7 | Hosted seams: principals, accounting, sandboxing. |
+| Stage | Adds | Unlocked by |
+|---|---|---|
+| 1 | Vertical slice: graph at width 1, core tools, policy gate, one backend | — |
+| 2 | Full core toolset, graph mutation, verification tiers 1–2, budgets | Stage 1 |
+| 3 | Symbol index, scoped tool exposure, capability providers | Stage 2 |
+| 4 | Isolated units, result contracts, checkpoints, shadow snapshots | Stages 2–3 |
+| 5 | Stuck detection and recovery strategies | Stage 4 |
+| 6 | Dependency and call graphs, change-impact analysis, targeted tests | Stage 3 |
+| 7 | Router, cascade, critic; speculative decoding when GPU hardware arrives | Stages 2–6 |
+| 8 | Trajectory capture and the eval suite | Stage 2 onward — earlier is better |
+| 9 | Memory, architecture maps, identity eval | Stages 5–6 |
+| 10 | Concurrency > 1, self-consistency, speculative branches | GPU hardware |
+| 11 | VS Code extension; desktop and web clients | Stage 2 onward |
+| 12 | Inference workers on a second machine | Stage 7 |
+| 13 | Distillation pipeline and the first Solara-tuned model | Stage 8 plus real usage |
+| 14 | Hosted seams: principals, accounting, sandboxing, workspace sync | Everything above |
+
+Stage 8 is placed early deliberately. Trajectory capture and the eval suite are
+cheap to build and compound in value the longer they run; adding them late discards
+every measurement that could have been taken in the meantime.
 
 ---
 
-*Derived from [`decisions.md`](./decisions.md) — D0 through D20, constraints C1–C8,
-and product constraints P1–P5.*
+*Derived from [`decisions.md`](./decisions.md) — constraints C1–C8, product
+constraints P1–P5, decisions D0–D26.*

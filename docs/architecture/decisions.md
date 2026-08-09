@@ -603,6 +603,157 @@ at all, and that must be an ordinary condition rather than an error.
 
 ---
 
+## Power expansion (D21–D26)
+
+The decisions D0–D20 produced a correct but **conservative** architecture. The root
+cause was identified explicitly: the current laptop was allowed to constrain the
+*structure* of the system rather than only its *default configuration*, which
+contradicts C7. D21–D26 correct that.
+
+The governing rule for all six: **capability in the architecture, modest defaults in
+configuration.** Every mechanism below must degrade to current behaviour when its
+resource budget is set to one.
+
+### DECIDED — D21: The agent loop becomes an execution graph with a resource-aware scheduler
+
+*Supersedes the loop structure of D7. D7's plan state, sub-session rules, and
+delegation economics are retained and generalised.*
+
+A task is a **directed acyclic graph of work units**, not a loop. Each unit declares
+its kind, inputs, dependencies, context policy, resource class, permission subset,
+and an explicit result contract. A **scheduler** executes any unit whose
+dependencies are satisfied, subject to a resource budget.
+
+**A loop is a graph of width one.** Setting concurrency to 1 reproduces D7 exactly,
+which is what makes this safe to adopt now and valuable later.
+
+**The plan *is* the graph.** D7's revisable plan and the execution structure unify:
+when the model revises the plan it mutates the graph. There is no longer a plan
+artifact separate from the execution structure that could drift from it.
+
+**Concurrency is resource-derived, not a constant.** The scheduler admits work
+against KV-cache capacity, model-slot availability, and — critically — the
+*compute characteristics of the backend*. Under llama.cpp, concurrent requests share
+model weights through continuous batching, so a slot costs KV cache rather than a
+second copy of the model: roughly 56 KB/token for Qwen2.5-Coder-7B, about 450 MB at
+8k context. **On GPU this makes concurrency cheap; on CPU it does not**, because
+parallel slots contend for the same few cores and throughput barely improves. The
+scheduler must model this or it will "parallelise" a CPU host into being slower.
+
+Unlocked by this: parallel exploration, verification concurrent with editing,
+speculative competing approaches, and self-consistency sampling.
+
+Detail: [`execution-graph.md`](./execution-graph.md).
+
+### DECIDED — D22: Model orchestration is cascading and speculative, not merely routing
+
+*Extends D5, which selected a profile but did nothing more.*
+
+Four distinct mechanisms, deliberately not conflated:
+
+1. **Speculative decoding** — a small draft model proposes tokens that the target
+   model verifies in a single forward pass. Code is highly predictable, so
+   acceptance rates are high. Realistic gains: roughly 2–3× on GPU, more modest on
+   CPU where the verification pass is itself compute-bound. Requires a
+   vocabulary-compatible draft model.
+2. **Cascade** — cheap tier attempts, a verifier checks, escalation to a larger tier
+   only on failure. Worth it exactly when the cheap tier's success rate is high and
+   the cost gap is large: mechanical edits, classification, summarisation, triage.
+   Not worth it for novel design work.
+3. **Critic pass** — a second call reviews an edit before application. Phase-scoped
+   and configurable, because it doubles the cost of the edit path.
+4. **Self-consistency** — sample several solutions, select by verification. Requires
+   D21's parallelism to be affordable.
+
+The router becomes a real, inspectable component mapping *(unit kind, estimated
+complexity, remaining budget, hardware profile)* to a tier, with user override.
+
+Detail: [`model-orchestration.md`](./model-orchestration.md).
+
+### DECIDED — D23: Code intelligence extends from symbols to graphs and impact analysis
+
+*Extends D12. The structural, VCS-agnostic, tiered approach is unchanged; the depth
+above it is new.*
+
+Layered on the symbol index: a dependency graph, a call graph, **change-impact
+analysis** (given an edit to a symbol, the transitive reverse-dependency set and the
+tests covering it), a generated architecture map, and — when version control is
+present — history intelligence such as churn hotspots and co-change coupling.
+
+Change-impact analysis is the payoff: it is what makes D19's "targeted tests" tier
+actually targeted, and it is the real requirement hiding behind "understand large
+codebases."
+
+**Edges are labelled `certain` or `heuristic`.** Precise call graphs are undecidable
+for dynamic languages; the agent is told which edges it can trust rather than being
+silently misled.
+
+Detail: [`code-intelligence.md`](./code-intelligence.md).
+
+### DECIDED — D24: Failure, stuck-detection and recovery are architected, not incidental
+
+Explicit stuck signals: repeated near-identical tool calls, no file-state change
+across successive units, verification failing identically, edits repeatedly failing
+exact match, oscillating edits, and budget consumed without plan progress.
+
+Escalating responses: **reflect** (a forced cheap unit summarising what was tried
+and why it failed, which frequently unsticks), **backtrack** to a checkpoint,
+**switch strategy**, **escalate to the user** with a real account of what was
+attempted, and finally **abort to a clean state**.
+
+Backtracking requires undoing file edits, and per C8 it cannot depend on version
+control. Solara therefore maintains a **shadow snapshot store**: copy-on-write
+copies of touched files keyed by checkpoint, independent of any VCS.
+
+Every task carries a **budget** — tokens, wall-clock, tool calls, and (under P2)
+credits. Exhaustion escalates; it never silently continues.
+
+Detail: [`resilience.md`](./resilience.md).
+
+### DECIDED — D25: A learning flywheel, driven by implicit signals
+
+Sessions produce **trajectories**: prompts, outputs, tool calls, results, edits,
+verification outcomes, and user interventions.
+
+Outcomes are labelled from **implicit signals**, because no one labels manually:
+did verification pass, was the edit accepted, was it reverted immediately, did the
+user rephrase the same request (a strong failure signal), was the task abandoned.
+
+The **eval suite is a ratchet** — a growing set of frozen, checkable tasks that every
+model, prompt, and architecture change is measured against. Its purpose is to catch
+silent regression, which is the failure mode that actually kills systems like this.
+
+The realistic path to Solara-specific models is **distillation**: a strong remote
+backend (D4) generates reference trajectories, verification filters them, and the
+survivors become supervised fine-tuning data for a small local model.
+
+**Trajectories contain user code.** They are local-only by default; any collection is
+explicit opt-in. Required by P5 regardless.
+
+Detail: [`learning.md`](./learning.md).
+
+### DECIDED — D26: Compute is a pool of typed workers; inference and execution distribute differently
+
+Workers declare capabilities and are scheduled by D21. The split is the whole
+decision:
+
+- **Inference workers** hold models and are **freely poolable** — local process,
+  remote GPU machine, or cloud endpoint. They exchange tokens, not state. D4's
+  `ModelBackend` interface already permits this; what is added is a worker registry
+  and scheduler awareness, which makes it a comparatively cheap capability.
+- **Execution workers** run tools and commands and are **bound to the filesystem
+  holding the workspace**. Tests cannot run remotely against local files. Remote
+  execution therefore requires a synchronised workspace, which is the hosted
+  deployment problem from D0 and is not solved here.
+
+Stating the asymmetry is the point: it is what keeps distributed execution from
+becoming an unbuildable promise. The immediate, realistic capability is offloading
+inference to a stronger machine while the workspace stays local.
+
+Detail: [`distribution.md`](./distribution.md).
+
+---
+
 ## Open decisions
 
 Recorded here so the design cannot silently skip them. Roughly in dependency order.
@@ -662,3 +813,4 @@ terminal client. Each has a defined seam and is added once the spine is proven.
 | 2026-08-09 | D6–D9 recorded, closing O1–O4. Tool-call protocol, agent loop with ephemeral sub-sessions, tool organisation, and the policy mediation gate are settled. |
 | 2026-08-09 | **C8 added** — Solara targets workspaces, not repositories; version control is a capability, not a prerequisite. O7 reframed accordingly. D10–D14 recorded, closing O5–O8 and O10. O13–O15 added: edit application, verification, and the first milestone were missing from the log. |
 | 2026-08-09 | D15–D20 recorded, closing O9 and O11–O15. The event system resolves into an outbound stream with no internal bus; sessions, the API, edit application, verification, and the first milestone are settled. Formal architecture written to `architecture.md`. |
+| 2026-08-09 | **Power expansion.** D0–D20 were judged too conservative: current hardware had been allowed to constrain structure rather than defaults, contradicting C7. D21–D26 correct this — execution graph and scheduler, cascading model orchestration, deep code intelligence, architected resilience, a learning flywheel, and typed worker pools. Governing rule: capability in the architecture, modest defaults in configuration. Six deep-dive documents added; `architecture.md` rewritten. |

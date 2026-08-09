@@ -487,6 +487,120 @@ rules out; drifts silently on model change with nothing to catch it); prompt-now
 fine-tune-later with nothing in between (honest about the destination, but leaves
 identity unenforced for the entire period in which the project is actually built).
 
+### DECIDED — D15: A typed outbound event stream, but no internal message bus
+
+The original vision named an "event system." It resolves into two separate things,
+and only one of them is warranted.
+
+**Adopted — an outbound activity stream.** The daemon emits a typed, versioned
+stream of everything happening inside a task: token deltas, tool call started and
+finished, approval requested and resolved, plan revised, sub-session opened and
+closed, errors, and usage accounting. This is not optional — under D1 the
+interfaces are thin, and a thin client can only render what it is told. The stream
+is part of the API contract (D17).
+
+**Rejected — an internal publish/subscribe bus.** Decoupling core components
+through an internal bus makes control flow untraceable and failures hard to
+attribute, in exchange for flexibility the system does not yet need. Components
+call each other directly.
+
+**The seam that satisfies the original intent:** observability consumers — logging,
+tracing, metrics, and later credit accounting (P2) — subscribe to the *same* typed
+stream that goes outbound. Different parts of Solara can therefore react to what
+happens inside it without inverting control flow. If an internal bus later proves
+necessary, this stream is the natural place it grows from.
+
+### DECIDED — D16: Workspaces, sessions, and sub-sessions are distinct persisted entities
+
+**Workspace** — identified by its normalised absolute root paths, plus version
+control remote identity when one exists (per C8, it often will not). Owns the
+roots, the memory file (D13), the structural index (D12), the permission policy
+(D9), and the set of active capability providers (D8). Long-lived and shared:
+several sessions may attach to one workspace and reuse its index and memory.
+
+**Session** — a conversation and task thread bound to exactly one workspace. Owns
+the plan (D7), the working set (D11), conversation history, and its granted
+permissions. Persisted and resumable, so a task interrupted at 4 tok/s is not lost.
+
+**Sub-session** — a child of a session per D7. Owns its own context, inherits a
+subset of the parent's permissions, is persisted independently, and is evicted from
+the parent's context on completion while remaining addressable by ID.
+
+Every session has an owning **principal** — the single implicit local owner today,
+an authenticated account under a hosted deployment (D0).
+
+### DECIDED — D17: HTTP for operations, WebSocket for the event stream, versioned from day one
+
+Request/response operations over HTTP; the D15 activity stream over WebSocket.
+Bound to loopback only, authenticated by a per-session bearer token stored with
+restricted file permissions — the D1 security consequence, restated because it is
+easy to lose during implementation.
+
+The surface covers session lifecycle (create, resume, list, delete), sending a
+request, **interruption**, approval responses, workspace management, and model
+profile selection (D5).
+
+Two properties are load-bearing rather than incidental:
+
+- **Interruption is first-class.** At 3–6 tok/s a user will stop a running task
+  constantly. Interruption that only takes effect between model calls is not good
+  enough; it must cancel mid-generation and leave the session in a resumable state.
+- **Approvals round-trip over the stream** with a correlation ID, originating at
+  any sub-session depth (D9). No attached interface, or an expired request, means
+  **deny** — never allow.
+
+The API is versioned from the first commit, because three interfaces will depend
+on it and they will not upgrade in lockstep.
+
+### DECIDED — D18: Edits are applied as validated search/replace blocks
+
+The model emits the exact existing text and its replacement. Solara applies the
+change only on an exact match, and validates the result before committing it.
+
+*Rationale — this is the decision most constrained by the hardware envelope.* Full
+file rewrites are the most reliable format for small models, but the output cost is
+disqualifying: a 500-line file is roughly 6,000 output tokens, which at 3–6 tok/s is
+**15–30 minutes for one edit**. Unified diffs are compact but require line
+arithmetic and hunk headers that small models get wrong frequently. Search/replace
+blocks are compact (only the changed region is emitted), require no line numbers,
+and are *verifiable before application* — an inexact match fails loudly instead of
+corrupting the file. They also fit D6's text protocol directly and can be
+grammar-constrained under D10.
+
+**Validation uses the D12 parser.** Because tree-sitter is already present for
+indexing, every edit is parse-checked after application; an edit that breaks the
+file's syntax is rejected and reported rather than written. This is a genuine
+benefit of choosing structural indexing in D12.
+
+**Failure handling is defined, not incidental.** A failed exact match triggers a
+re-read of the region and one retry against fresh content. Repeated failure
+escalates to rewriting only the enclosing function or block — never the whole file.
+Edits are staged and applied atomically per tool call, with the original retained
+for undo.
+
+### DECIDED — D19: Verification is a phase of the loop, tiered cheapest-first
+
+A coding agent is distinguished from a code generator by whether it checks its own
+work. Verification is therefore an explicit phase of D7's loop, escalating only as
+far as needed:
+
+| Tier | Check | Cost |
+|---|---|---|
+| 1 | Syntax/parse via tree-sitter | Instant, already available (D12) |
+| 2 | Type check or lint, if the workspace configures one | Seconds |
+| 3 | Targeted tests — only those plausibly affected | Moderate |
+| 4 | Full suite, build, or running the program | Expensive; on request or at task completion |
+
+**Failure output is triaged, never dumped.** Build and test logs are enormous and
+pasting one raw would destroy the context D11 works to protect. Large failures are
+triaged in a sub-session (D7) — the ideal case for delegation, since it reads a lot
+and returns a little — which returns the essential diagnosis to the parent's working
+set.
+
+The runner is a **capability provider** (D8) that detects the workspace's toolchain
+rather than hardcoding one, consistent with C8: many workspaces have no test runner
+at all, and that must be an ordinary condition rather than an error.
+
 ---
 
 ## Open decisions
@@ -503,13 +617,40 @@ Recorded here so the design cannot silently skip them. Roughly in dependency ord
 | ~~O6~~ | Context assembly | **Closed by D11.** |
 | ~~O7~~ | Repository intelligence — *reframed as workspace intelligence per C8* | **Closed by D12.** |
 | ~~O8~~ | Memory | **Closed by D13.** |
-| O9 | **Event system** — whether one is warranted, and what it is genuinely for. | Named in the original vision, but must justify itself rather than be assumed. |
+| ~~O9~~ | Event system | **Closed by D15.** |
 | ~~O10~~ | Identity expression | **Closed by D14.** |
-| O11 | **Session and workspace model** — what a session is, what it owns, how workspaces are identified and persisted. | Underpins memory, permissions, and the daemon API surface. Raised in importance by C8. |
-| O12 | **Daemon API protocol** — request/response shape, streaming, interruption, approval round-trips. | The contract all three interfaces depend on; expensive to change later. |
-| O13 | **Edit application strategy** — how model-proposed changes are applied to files (full rewrite, unified diff, search/replace blocks) and how failures are recovered. | A top source of failure in coding agents, and highly sensitive to model size. |
-| O14 | **Verification loop** — how Solara knows a change worked: running tests, builds, or the program itself, and feeding failures back. | The difference between a code generator and a coding agent. |
-| O15 | **First implementation milestone** — the narrowest vertical slice that exercises the architecture end to end. | Determines whether the design survives contact with reality. |
+| ~~O11~~ | Session and workspace model | **Closed by D16.** |
+| ~~O12~~ | Daemon API protocol | **Closed by D17.** |
+| ~~O13~~ | Edit application strategy | **Closed by D18.** |
+| ~~O14~~ | Verification loop | **Closed by D19.** |
+| ~~O15~~ | First implementation milestone | **Closed by D20.** |
+
+All decisions identified so far are closed. The formal architecture derived from
+them is in [`architecture.md`](./architecture.md).
+
+New open decisions are expected to appear during implementation and should be
+added here rather than settled silently in code.
+
+### DECIDED — D20: The first milestone is one narrow vertical slice, end to end
+
+The first implementation is **not** a layer-by-layer build. It is the thinnest path
+that touches every layer: a terminal client → daemon → session → agent loop → tool
+protocol → policy gate → core tools → llama.cpp backend, running a real task against
+a real workspace on the current hardware.
+
+Concretely: *read a file, make one search/replace edit, verify it parses, report
+back* — with a 1.5B or 3B model first, because iteration speed matters more than
+capability while the plumbing is being proven.
+
+*Rationale:* the architecture's risky assumptions are all at the seams — whether a
+small model can drive the D6 protocol, whether D18 edits apply cleanly, whether D11
+assembly stays inside budget, whether the loop is bearable at local speeds. A
+vertical slice tests all of them in days. A horizontal build tests none of them for
+months, and every one of those assumptions is cheaper to correct early.
+
+*Deliberately excluded from the first slice:* sub-sessions, the persistent index,
+memory, capability providers beyond the core tools, and every interface except the
+terminal client. Each has a defined seam and is added once the spine is proven.
 
 ---
 
@@ -520,3 +661,4 @@ Recorded here so the design cannot silently skip them. Roughly in dependency ord
 | 2026-08-09 | Log created. D0–D5 recorded. Repository cleared; prior Terms of Service draft removed, with its architectural implications extracted into "Product-shape constraints" above. |
 | 2026-08-09 | D6–D9 recorded, closing O1–O4. Tool-call protocol, agent loop with ephemeral sub-sessions, tool organisation, and the policy mediation gate are settled. |
 | 2026-08-09 | **C8 added** — Solara targets workspaces, not repositories; version control is a capability, not a prerequisite. O7 reframed accordingly. D10–D14 recorded, closing O5–O8 and O10. O13–O15 added: edit application, verification, and the first milestone were missing from the log. |
+| 2026-08-09 | D15–D20 recorded, closing O9 and O11–O15. The event system resolves into an outbound stream with no internal bus; sessions, the API, edit application, verification, and the first milestone are settled. Formal architecture written to `architecture.md`. |
